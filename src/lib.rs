@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![warn(clippy::pedantic)]
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 use openidconnect::core::CoreProviderMetadata;
@@ -135,34 +136,40 @@ impl Validator {
 
         // Obtain a read only copy of our jwks cache
         let read_cache = self.cache.read().await;
-        match read_cache.get_decoding_key(&kid) {
-            Some((key, alg)) => self.decode::<T>(token, key, alg),
+        if let Some((key, alg)) = read_cache.get_decoding_key(&kid) {
+            self.decode::<T>(token, key, *alg)
             // if we haven't decoded the JWK yet then do it and add it to our cache
-            None => {
-                // Drop our read lock
-                drop(read_cache);
+        } else {
+            // Drop our read lock
+            drop(read_cache);
+            //scope write lock
+            {
                 // get a write lock and modify the cache
-                {
-                    let mut write_cache = self.cache.write().await;
-                    write_cache
-                        .add_decoding_key(kid.clone())
-                        .map_err(|_| JWKSValidationError::MiddingKid)?;
-                }
+                let mut write_cache = self.cache.write().await;
+                let update = write_cache.add_decoding_key(kid.clone());
 
-                //re-acquire the read lock
-                let read_cache = self.cache.read().await;
-                let (key, alg) = read_cache.get_decoding_key(&kid).unwrap();
-                self.decode::<T>(token, key, alg)
+                // if there was an error adding the decoding key to our cache
+                if update.is_err() {
+                    // drop the write lock.
+                    drop(write_cache);
+                    //update the cache
+                    self.update_cache().await;
+                    return Err(JWKSValidationError::MiddingKid);
+                }
             }
+            //re-acquire the read lock
+            let read_cache = self.cache.read().await;
+            // unwrap is panic safe because if we've reached this point, adding the key to the cache was sucessful
+            let (key, alg) = read_cache.get_decoding_key(&kid).unwrap();
+            self.decode::<T>(token, key, *alg)
         }
     }
 
     fn decode<T>(
         &self,
-
         token: &str,
         key: &DecodingKey,
-        alg: &Option<Algorithm>,
+        alg: Option<Algorithm>,
     ) -> Result<TokenData<T>, JWKSValidationError>
     where
         T: for<'de> serde::de::Deserialize<'de>,
@@ -192,6 +199,8 @@ impl JWKSCache {
 
     pub fn add_decoding_key(&mut self, kid: String) -> Result<(), CacheError> {
         // Otherwise check the jwks for the key id
+
+        // TODO If the KID doesn't exist, then we shoud refresh the jwks URL, just in case
         let jwk = self.jwks.find(&kid).ok_or(CacheError::MissingKid)?;
 
         let key = decode_jwk(jwk).map_err(|_| CacheError::DecodeError)?;
@@ -236,6 +245,7 @@ fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, jsonwebtoken::errors:
         .map_err(|e| jsonwebtoken::errors::ErrorKind::Base64(e).into())
 }
 
+///Wrapper Type for a Validator, and the associated task to update the JWKS
 struct ValidatorParent {
     validator: Arc<Validator>,
     update_task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -318,14 +328,14 @@ impl Drop for ValidatorParent {
             let lock = update_task.lock().await;
             // If there's a running update task, abort it
             if let Some(handle) = &*lock {
-                handle.abort()
+                handle.abort();
             }
         });
     }
 }
 /// Determines settings about updating the JWKS in the background
 /// By default will wait the entire refresh period before triggering an update
-/// unless immediate_refresh is set to `true`.
+/// unless `immediate_refresh` is set to `true`.
 #[derive(Debug, Clone, Copy)]
 struct JwksUpdateConfig {
     /// Time in Seconds to refresh the JWKS from the OIDC Provider
