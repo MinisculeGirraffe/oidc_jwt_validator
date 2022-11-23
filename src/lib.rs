@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use moka::sync::Cache;
+
+pub mod middleware;
+
 
 // get our oidc config
 async fn get_provider(url: impl ToString) -> Result<CoreProviderMetadata, JWKSFetchError> {
@@ -94,31 +96,44 @@ impl Validator {
             .map_err(|_| JWKSFetchError::JSONDecodeError)
     }
 
-    async fn update_cache(&self) -> Result<(), JWKSFetchError> {
+    async fn update_cache(&self) -> Result<CacheUpdateAction, JWKSFetchError> {
         // Get the JWKS via HTTP Request, and a read lock on the cache simultanously
         // Most of the time the JWKS won't change
         // we first get a read lock to determine if is has changed or not, which will typically be the case
         // Since a read lock won't require exclusive access and disrupt validation temporarily
         let (new_jwks, read) = tokio::join!(self.get_jwks(), self.cache.read());
-        let new_jwks = new_jwks?;
+        let mut new_jwks = new_jwks?;
 
         // if the new jwks is the same as the old
         if read.jwks == new_jwks {
             // Early return without doing anything
-            return Ok(());
+            return Ok(CacheUpdateAction::NoUpdate);
         }
-        // only runs If the new jwks has changed
+        // Below only runs If the new jwks has changed
         // Drop the read lock and acquire a write lock otherwise we deadlock
         drop(read);
 
-        //acquire a write lock
+        // Parse the JWKs into their decoding keys in a task
+        // so we don't block the executor.
+        let keys = {
+            let new_jwks = new_jwks.clone();
+            tokio::task::spawn_blocking(|| {
+                new_jwks.keys.into_iter().filter_map(|i| decode_jwk(i).ok())
+            })
+            .await
+            .map_err(|_| JWKSFetchError::IssuerParseError)?
+        };
+        //acquire a write lock only to make the updates to the cache
         let mut write = self.cache.write().await;
-        // Clear our cache of decoding keys
-        write.decoding_map.clear();
         // Over-write the value inside of the RwLock
         write.jwks = new_jwks;
-
-        Ok(())
+        // Clear our cache of decoding keys
+        write.decoding_map.clear();
+        // Load the keys back into our cache hashmap.
+        for key in keys {
+            write.decoding_map.insert(key.0, Arc::new(key.1));
+        }
+        Ok(CacheUpdateAction::UpdateSucessful)
     }
 
     /// Validates a JWT, Returning the claims serialized into type of T
@@ -135,56 +150,50 @@ impl Validator {
             jsonwebtoken::decode_header(token).map_err(|_| JWKSValidationError::InvalidHeader)?;
         let kid = header.kid.ok_or(JWKSValidationError::MiddingKid)?;
 
-        // Obtain a read only copy of our jwks cache
-        let read_cache = self.cache.read().await;
-        if let Some((key, alg)) = read_cache.get_decoding_key(&kid) {
-            self.decode::<T>(token, key, *alg)
-            // if we haven't decoded the JWK yet then do it and add it to our cache
-        } else {
-            // Drop our read lock
-            drop(read_cache);
-            //scope write lock
-            {
-                // get a write lock and modify the cache
-                let mut write_cache = self.cache.write().await;
-                let update = write_cache.add_decoding_key(kid.clone());
-
-                // if there was an error adding the decoding key to our cache
-                if update.is_err() {
-                    // drop the write lock.
-                    drop(write_cache);
-                    //update the cache
-                    self.update_cache().await;
-                    return Err(JWKSValidationError::MiddingKid);
-                }
-            }
-            //re-acquire the read lock
-            let read_cache = self.cache.read().await;
-            // unwrap is panic safe because if we've reached this point, adding the key to the cache was sucessful
-            let (key, alg) = read_cache.get_decoding_key(&kid).unwrap();
-            self.decode::<T>(token, key, *alg)
-        }
+        self.get_kid_retry(kid).await?.decode(token)
     }
 
-    fn decode<T>(
+    async fn get_kid_retry(
         &self,
-        token: &str,
-        key: &DecodingKey,
-        alg: Option<Algorithm>,
-    ) -> Result<TokenData<T>, JWKSValidationError>
-    where
-        T: for<'de> serde::de::Deserialize<'de>,
-    {
-        let alg = alg.ok_or(JWKSValidationError::InvalidAlgo)?;
-        let validation = Validation::new(alg);
-        jsonwebtoken::decode::<T>(token, key, &validation)
-            .map_err(|_| JWKSValidationError::DecodeError)
+        kid: impl AsRef<str>,
+    ) -> Result<Arc<DecodingInfo>, JWKSValidationError> {
+        // Check to see if we have the kid
+        match self.get_kid(&kid).await {
+            // if we have it, then return it
+            Some(key) => Ok(key),
+            // if we don't have it
+            None => {
+                // Try and invalidate our cache. Maybe the JWKS has changed
+                if let Ok(action) = self.update_cache().await {
+                    match action {
+                        // If the cache hasn't changed then we know the kid just doesn't exist
+                        CacheUpdateAction::NoUpdate => Err(JWKSValidationError::NonMatchingJWK),
+                        // if the cache has changed, check if the kid is present
+                        CacheUpdateAction::UpdateSucessful => self
+                            .get_kid(kid)
+                            .await
+                            .ok_or(JWKSValidationError::NonMatchingJWK),
+                    }
+                } else {
+                    Err(JWKSValidationError::NonMatchingJWK)
+                }
+            }
+        }
+        // If the kid isn't in the JWKS do a refresh on the JWKS URL to see if it's changed
+
+        // if it's still not in the jwks after a refresh, return an error
+    }
+
+    async fn get_kid(&self, kid: impl AsRef<str>) -> Option<Arc<DecodingInfo>> {
+        let read_cache = &self.cache.read().await;
+        // Check and see if the decoding key for the kid is in already in our cache
+        read_cache.decoding_map.get(kid.as_ref()).cloned()
     }
 }
 
 struct JWKSCache {
     jwks: JwkSet,
-    decoding_map: HashMap<String, (DecodingKey, Option<Algorithm>)>,
+    decoding_map: HashMap<String, Arc<DecodingInfo>>,
 }
 impl JWKSCache {
     pub fn new(jwks: JwkSet) -> Self {
@@ -193,22 +202,6 @@ impl JWKSCache {
             decoding_map: HashMap::new(),
         }
     }
-
-    pub fn get_decoding_key(&self, kid: &str) -> Option<&(DecodingKey, Option<Algorithm>)> {
-        self.decoding_map.get(kid)
-    }
-
-    pub fn add_decoding_key(&mut self, kid: String) -> Result<(), CacheError> {
-        // Otherwise check the jwks for the key id
-
-        // TODO If the KID doesn't exist, then we shoud refresh the jwks URL, just in case
-        let jwk = self.jwks.find(&kid).ok_or(CacheError::MissingKid)?;
-
-        let key = decode_jwk(jwk).map_err(|_| CacheError::DecodeError)?;
-
-        self.decoding_map.insert(kid, (key, jwk.common.algorithm));
-        Ok(())
-    }
 }
 
 enum CacheError {
@@ -216,8 +209,11 @@ enum CacheError {
     DecodeError,
 }
 
-fn decode_jwk(jwk: &Jwk) -> Result<DecodingKey, jsonwebtoken::errors::Error> {
-    match jwk.algorithm {
+fn decode_jwk(jwk: Jwk) -> Result<(String, DecodingInfo), JWKSValidationError> {
+    let kid = jwk.common.key_id.clone();
+    let alg = jwk.common.algorithm;
+
+    let dec_key = match jwk.algorithm {
         jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(ref params) => {
             let x_cmp = b64_decode(&params.x)?;
             let y_cmp = b64_decode(&params.y)?;
@@ -225,25 +221,32 @@ fn decode_jwk(jwk: &Jwk) -> Result<DecodingKey, jsonwebtoken::errors::Error> {
             public_key.push(0x04);
             public_key.extend_from_slice(&x_cmp);
             public_key.extend_from_slice(&y_cmp);
-            Ok(DecodingKey::from_ec_der(&public_key))
+            Some(DecodingKey::from_ec_der(&public_key))
         }
         jsonwebtoken::jwk::AlgorithmParameters::RSA(ref params) => {
-            DecodingKey::from_rsa_components(&params.n, &params.e)
+            DecodingKey::from_rsa_components(&params.n, &params.e).ok()
         }
         jsonwebtoken::jwk::AlgorithmParameters::OctetKey(ref params) => {
-            DecodingKey::from_base64_secret(&params.value)
+            DecodingKey::from_base64_secret(&params.value).ok()
         }
         jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(ref params) => {
-            let der = b64_decode(&params.x)?;
+            let der = b64_decode(&params.x).map_err(|_| JWKSValidationError::InvakidJKW)?;
 
-            Ok(DecodingKey::from_ed_der(&der))
+            Some(DecodingKey::from_ed_der(&der))
         }
+    };
+    match (kid, alg, dec_key) {
+        (Some(kid), Some(alg), Some(dec_key)) => {
+            let info = DecodingInfo::new(jwk, dec_key, alg);
+            Ok((kid, info))
+        }
+        _ => Err(JWKSValidationError::InvakidJKW),
     }
 }
 
-fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, jsonwebtoken::errors::Error> {
+fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, JWKSValidationError> {
     base64::decode_config(input, base64::URL_SAFE_NO_PAD)
-        .map_err(|e| jsonwebtoken::errors::ErrorKind::Base64(e).into())
+        .map_err(|e| JWKSValidationError::DecodeError)
 }
 
 ///Wrapper Type for a Validator, and the associated task to update the JWKS
@@ -326,16 +329,15 @@ impl Drop for ValidatorParent {
 
         tokio::task::spawn(async move {
             // Wait for the lock
-            let lock = update_task.lock().await;
+            let mut lock = update_task.lock().await;
             // If there's a running update task, abort it
             if let Some(handle) = &*lock {
                 handle.abort();
+                *lock = None;
             }
         });
     }
 }
-
-
 
 /// Determines settings about updating the JWKS in the background
 /// By default will wait the entire refresh period before triggering an update
@@ -363,7 +365,6 @@ impl Default for JwksUpdateConfig {
     }
 }
 
-
 // Todo Fetch the jwks based on the cache control header.
 // the poll time should be the cache control header
 // if no-cache then we should poll for a minimum amount of time
@@ -371,35 +372,36 @@ impl Default for JwksUpdateConfig {
 // because like holy fuck that just seems inefficent
 
 
-/*
-The FHIR Bulk Data Access Implementation Guide from HL7 includes the following section:
-
-The client SHOULD return a “Cache-Control” header in its JWKS response
-
-The authorization server SHALL NOT cache a JWKS for longer than the client’s cache-control header indicates.
-The authorization server SHOULD cache a client’s JWK Set according to the client’s cache-control header; it doesn’t need to retrieve it anew every time.
-
-
-Situations:
- - No cache-control header not present
- Wild fucking west I guess. Pick a value that makes sense
- - cache-control: no-cache
- Technically we're not supposed to be doing caching at all.
- But like cmon. That also makes no sense. Poll every 5 seconds maybe? 
- - cache-control: max-age=X
- Respect the max-age
-
-
- Caching Optimizations
-
-Store the parsed JWKset so it doesn't have to be de-serialized every time
-Even if the cache is set to no-cache, We can validate the response is equal to the last to skip the de-serialization and cache updates
-
-We can store the decoding key of each JWK so long as the jwks has not changed to prevent re-parsing them.
-
-*/
-
 enum CacheStrat {
     Automatic,
-    ManualRefresh(JwksUpdateConfig)
+    ManualRefresh(JwksUpdateConfig),
+}
+
+enum CacheUpdateAction {
+    // We checked the JWKS uri and it was the same as the last time we refreshed it so no action was taken
+    NoUpdate,
+    // We checked the JWKS uri and it was different so we updated our local cache
+    UpdateSucessful,
+}
+
+/// Struct used to store all information needed to decode a JWT
+/// Intended to be cached to prevent decoding information about the same JWK multiple times
+struct DecodingInfo {
+    jwk: Jwk,
+    key: DecodingKey,
+    alg: Algorithm,
+}
+impl DecodingInfo {
+    fn new(jwk: Jwk, key: DecodingKey, alg: Algorithm) -> Self {
+        Self { jwk, key, alg }
+    }
+
+    fn decode<T>(&self, token: &str) -> Result<TokenData<T>, JWKSValidationError>
+    where
+        T: for<'de> serde::de::Deserialize<'de>,
+    {
+        let validation = Validation::new(self.alg);
+        jsonwebtoken::decode::<T>(token, &self.key, &validation)
+            .map_err(|_| JWKSValidationError::DecodeError)
+    }
 }
