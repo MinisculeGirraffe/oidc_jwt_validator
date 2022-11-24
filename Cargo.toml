@@ -5,7 +5,8 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-actix-web = ["dep:actix-web"]
+
+
 
 
 [dependencies]
@@ -13,7 +14,9 @@ jsonwebtoken = "8.1.1"
 openidconnect = "2.4.0"
 tokio = { version = "1.22.0", features = ["full"] }
 thiserror = "1.0.37"
-reqwest = { version = "0.11.13", features = ["json"] }
-serde = "1.0.147"
+reqwest = { version = "0.11.13", features = ["json","blocking"] }
+serde = {version = "1.0.147", features = ["derive"] }
 base64 = "0.13.1"
-actix-web = {version = "4.2.1", optional = true}
+actix-web = {version = "4.2.1"}
+tracing = "0.1.37"
+tokio-metrics = "0.1.0"

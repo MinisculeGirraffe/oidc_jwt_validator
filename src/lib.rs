@@ -1,19 +1,21 @@
-#![allow(unused)]
 #![warn(clippy::pedantic)]
+#![allow(unused, clippy::missing_errors_doc, clippy::must_use_candidate)]
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 use openidconnect::core::CoreProviderMetadata;
 use openidconnect::reqwest::async_http_client;
 use openidconnect::IssuerUrl;
+use reqwest::header::ToStrError;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, self};
+use tracing::instrument;
 
+use tracing::{debug, info, warn};
 pub mod middleware;
-
 
 // get our oidc config
 async fn get_provider(url: impl ToString) -> Result<CoreProviderMetadata, JWKSFetchError> {
@@ -26,7 +28,7 @@ async fn get_provider(url: impl ToString) -> Result<CoreProviderMetadata, JWKSFe
 }
 
 #[derive(Debug)]
-enum JWKSFetchError {
+pub enum JWKSFetchError {
     RequestFailed,
     DiscoverError,
     JSONDecodeError,
@@ -34,29 +36,31 @@ enum JWKSFetchError {
 }
 
 #[derive(Debug)]
-enum JWKSValidationError {
+pub enum JWKSValidationError {
     InvalidHeader,
     MiddingKid,
     InvakidJKW,
     InvalidAlgo,
     NonMatchingJWK,
     DecodeError,
+    MissingToken,
+    TokenParseFailed,
 }
-
-struct Validator {
+#[derive(Clone)]
+pub struct Validator {
     oidc_config: CoreProviderMetadata,
     http_client: reqwest::Client,
-    cache: RwLock<JWKSCache>,
+    cache: Arc<RwLock<JWKSCache>>,
 }
 
 impl Validator {
     pub async fn new(
         oidc_url: impl AsRef<str>,
         http_client: reqwest::Client,
-    ) -> Result<Validator, JWKSFetchError> {
+    ) -> Result<(Validator,JoinHandle<()>), JWKSFetchError> {
         //Create an empty JWKS to initalize our Cache
         let jwks = JwkSet { keys: Vec::new() };
-        let cache = RwLock::new(JWKSCache::new(jwks));
+        let cache = Arc::new(RwLock::new(JWKSCache::new(jwks)));
 
         //TODO CHANGE ME
         let oidc_config = get_provider(oidc_url.as_ref())
@@ -74,45 +78,53 @@ impl Validator {
         // This ensures it's ready to validate immediatly after use.
         client.update_cache().await?;
 
-        Ok(client)
-    }
-
-    async fn get_jwks(&self) -> Result<JwkSet, JWKSFetchError> {
-        // Get the jwks endpoint
-        let jwks_uri = self.oidc_config.jwks_uri().as_str();
-
-        // Send out GET HTTP Request
-        let response = self
-            .http_client
-            .get(jwks_uri)
-            .send()
-            .await
-            .map_err(|_| JWKSFetchError::RequestFailed)?;
-
-        //Parse the response into JSON
-        response
-            .json()
-            .await
-            .map_err(|_| JWKSFetchError::JSONDecodeError)
+        let task = {
+            let validator = client.clone();
+            tokio::task::spawn(async move {
+                println!("Hello from bg-task");
+                let duration = Duration::from_secs(10);
+                //Infinite Loop
+                loop {
+                  
+                    println!("Background Task: Attempting to update");
+                    match validator.update_cache().await {
+                        Ok(a) => {
+                            tokio::time::sleep(duration).await;
+                            println!("Background Task: Update Sucessful");
+                        }
+                        Err(e) => {
+                           tokio::time::sleep(duration).await;
+                            println!("Background Task: Update Failed: {:?}", e);
+                        }
+                    };
+                }
+            })
+        };
+        Ok((client,task))
     }
 
     async fn update_cache(&self) -> Result<CacheUpdateAction, JWKSFetchError> {
+        println!("Triggering update to JWKS Cache");
         // Get the JWKS via HTTP Request, and a read lock on the cache simultanously
         // Most of the time the JWKS won't change
         // we first get a read lock to determine if is has changed or not, which will typically be the case
         // Since a read lock won't require exclusive access and disrupt validation temporarily
-        let (new_jwks, read) = tokio::join!(self.get_jwks(), self.cache.read());
-        let mut new_jwks = new_jwks?;
+        let uri = self.oidc_config.jwks_uri().as_str().to_string();
+        let new_jwks = tokio::task::spawn_blocking(move || get_jwks(&uri))
+            .await
+            .unwrap()?;
+        println!("Update: Waiting on read lock");
+        let read = self.cache.read().await;
 
         // if the new jwks is the same as the old
         if read.jwks == new_jwks {
-            // Early return without doing anything
+            println!("JWKS Content has not changed since last update");
             return Ok(CacheUpdateAction::NoUpdate);
         }
         // Below only runs If the new jwks has changed
         // Drop the read lock and acquire a write lock otherwise we deadlock
         drop(read);
-
+        println!("JWKS Content has changed since last update. Updating cache.");
         // Parse the JWKs into their decoding keys in a task
         // so we don't block the executor.
         let keys = {
@@ -133,6 +145,7 @@ impl Validator {
         for key in keys {
             write.decoding_map.insert(key.0, Arc::new(key.1));
         }
+        println!("Cache Update Complete");
         Ok(CacheUpdateAction::UpdateSucessful)
     }
 
@@ -157,10 +170,15 @@ impl Validator {
         &self,
         kid: impl AsRef<str>,
     ) -> Result<Arc<DecodingInfo>, JWKSValidationError> {
+        let kid = kid.as_ref();
         // Check to see if we have the kid
+        println!("Checking KID: {kid}");
         match self.get_kid(&kid).await {
             // if we have it, then return it
-            Some(key) => Ok(key),
+            Some(key) => {
+                println!("KID Present in cache");
+                Ok(key)
+            }
             // if we don't have it
             None => {
                 // Try and invalidate our cache. Maybe the JWKS has changed
@@ -185,7 +203,9 @@ impl Validator {
     }
 
     async fn get_kid(&self, kid: impl AsRef<str>) -> Option<Arc<DecodingInfo>> {
+        println!("get_kid: waiting on read_lock");
         let read_cache = &self.cache.read().await;
+        println!("get_kid: got read_lock");
         // Check and see if the decoding key for the kid is in already in our cache
         read_cache.decoding_map.get(kid.as_ref()).cloned()
     }
@@ -249,55 +269,79 @@ fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, JWKSValidationError> 
         .map_err(|e| JWKSValidationError::DecodeError)
 }
 
+/* 
 ///Wrapper Type for a Validator, and the associated task to update the JWKS
-struct ValidatorParent {
-    validator: Arc<Validator>,
+#[derive(Clone)]
+pub struct ValidatorParent {
+    validator: Validator,
     update_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl ValidatorParent {
-    async fn new(
+    pub async fn new(
         url: impl AsRef<str>,
         client: reqwest::Client,
         update_config: JwksUpdateConfig,
-    ) -> Result<ValidatorParent, JWKSFetchError> {
-        let validator = Arc::new(Validator::new(url.as_ref(), client).await?);
-        // Unwrap is safe here because it's the first time we've spawned the task
-        let update_task = Arc::new(Mutex::new(None));
+    ) -> Result<(ValidatorParent,JoinHandle<()>), JWKSFetchError> {
+        let validator = Validator::new(url.as_ref(), client).await?;
+        let task = {
+            let validator = validator.clone();
+            tokio::spawn(async move {
+                println!("Hello from bg-task");
+                //Infinite Loop
+                loop {
+                  
+                    println!("Background Task: Attempting to update");
+                    match validator.update_cache().await {
+                        Ok(a) => {
+                            task::yield_now().await;
+                            println!("Background Task: Update Sucessful");
+                        }
+                        Err(e) => {
+                            task::yield_now().await;
+                            println!("Background Task: Update Failed: {:?}", e);
+                        }
+                    };
+                }
+            })
+        };
+    
         let updater = Self {
             validator,
-            update_task,
+  
         };
 
-        updater.start_jwks_update(update_config).await;
+   
 
         Ok(updater)
     }
     /// Spawns a tokio task that loops forever to periodically updating the JWKS cache
     /// Does nothing if a task has already been spawned
     pub async fn start_jwks_update(&self, config: JwksUpdateConfig) {
+        println!("Getting Task Lock");
+
         let mut lock = self.update_task.lock().await;
         if lock.is_none() {
+            println!("Task slot is none");
             // Create a copy of ourselves to move into the task
             let validator = self.validator.clone();
-            let task = tokio::task::spawn(async move {
-                let ok_period = Duration::from_secs(config.refresh);
-                let err_period = Duration::from_secs(config.err_refresh);
-
-                if !config.immediate_refresh {
-                    // Immediatly wait for our sleep period once
-                    // Since the validator comes pre-filled with the jwks keys
-                    // We typically don't need to re-fetch them right away
-                    tokio::time::sleep(ok_period).await;
-                }
+            let task = tokio::spawn(async move {
+                println!("Hello from bg-task");
                 //Infinite Loop
                 loop {
+                    println!("Background Task: Attempting to update");
                     match validator.update_cache().await {
-                        Ok(_) => tokio::time::sleep(ok_period).await,
-                        Err(_) => tokio::time::sleep(err_period).await,
+                        Ok(a) => {
+                            println!("Background Task: Update Sucessful");
+                        }
+                        Err(e) => {
+                            println!("Background Task: Update Failed: {:?}", e);
+                        }
                     };
                 }
             });
+
+            println!("Updated task slot to Some");
             *lock = Some(task);
         }
     }
@@ -315,7 +359,7 @@ impl ValidatorParent {
 }
 
 impl Deref for ValidatorParent {
-    type Target = Arc<Validator>;
+    type Target = Validator;
 
     fn deref(&self) -> &Self::Target {
         &self.validator
@@ -338,12 +382,13 @@ impl Drop for ValidatorParent {
         });
     }
 }
+*/
 
 /// Determines settings about updating the JWKS in the background
 /// By default will wait the entire refresh period before triggering an update
 /// unless `immediate_refresh` is set to `true`.
 #[derive(Debug, Clone, Copy)]
-struct JwksUpdateConfig {
+pub struct JwksUpdateConfig {
     /// Time in Seconds to refresh the JWKS from the OIDC Provider
     /// Default: 43200(12 hours)
     refresh: u64,
@@ -358,8 +403,8 @@ struct JwksUpdateConfig {
 impl Default for JwksUpdateConfig {
     fn default() -> Self {
         Self {
-            refresh: 43200,
-            err_refresh: 600,
+            refresh: 1,
+            err_refresh: 1,
             immediate_refresh: false,
         }
     }
@@ -370,7 +415,6 @@ impl Default for JwksUpdateConfig {
 // if no-cache then we should poll for a minimum amount of time
 // instead of literally just requesting it for every authentication
 // because like holy fuck that just seems inefficent
-
 
 enum CacheStrat {
     Automatic,
@@ -400,8 +444,34 @@ impl DecodingInfo {
     where
         T: for<'de> serde::de::Deserialize<'de>,
     {
+        println!("Validating Token");
         let validation = Validation::new(self.alg);
-        jsonwebtoken::decode::<T>(token, &self.key, &validation)
-            .map_err(|_| JWKSValidationError::DecodeError)
+        jsonwebtoken::decode::<T>(token, &self.key, &validation).map_err(|e| {
+            println!("{e}");
+            JWKSValidationError::DecodeError
+        })
     }
+}
+
+fn get_jwks(uri: &str) -> Result<JwkSet, JWKSFetchError> {
+    // Get the jwks endpoint
+    println!("Requesting JWKS From Uri: {uri}");
+    // Send out GET HTTP Request
+    let client = reqwest::ClientBuilder::new().build().unwrap();
+
+    let result = reqwest::blocking::get(uri).map_err(|e| {
+        println!("{e}");
+        JWKSFetchError::RequestFailed
+    })?;
+
+    println!("Waiting for json");
+    //Parse the response into JSON
+    let json = result.json().map_err(|e| {
+        println!("{e}");
+        JWKSFetchError::JSONDecodeError
+    });
+
+    println!("got  json");
+
+    json
 }
