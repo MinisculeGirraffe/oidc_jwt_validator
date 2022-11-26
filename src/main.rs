@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use actix_web::{http::StatusCode, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use actix_web::{FromRequest, HttpMessage};
+use env_logger::Env;
 use jsonwebtoken::TokenData;
+use oidc_jwt_validator::cache::CacheStrat;
 use oidc_jwt_validator::middleware::actix::{TokenInfo, ValidatorMiddlewareFactory};
 use oidc_jwt_validator::Validator;
 use serde::Deserialize;
@@ -15,7 +17,7 @@ async fn greet(user: Authenticated<UserClaims>) -> impl Responder {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    // construct a metrics taskmonitor
+    env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     let oidc_url = "https://keycloak.udp.lgbt/realms/Main";
 
@@ -24,7 +26,9 @@ async fn main() -> std::io::Result<()> {
         .build()
         .unwrap();
 
-    let (validator, task) = Validator::new(oidc_url, client).await.unwrap();
+    let validator = Validator::new(oidc_url, client, CacheStrat::Automatic)
+        .await
+        .unwrap();
 
     let server = HttpServer::new(move || {
         App::new()
@@ -35,9 +39,8 @@ async fn main() -> std::io::Result<()> {
     })
     .bind(("0.0.0.0", 8081))
     .unwrap()
-    .run();
-
-    tokio::join!(server, task);
+    .run()
+    .await;
 
     Ok(())
 }
