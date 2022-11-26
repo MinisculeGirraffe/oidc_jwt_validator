@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
         .await
         .unwrap();
 
-    let server = HttpServer::new(move || {
+    let _server = HttpServer::new(move || {
         App::new()
             .wrap(ValidatorMiddlewareFactory::<UserClaims, AuthError>::new(
                 validator.clone(),
@@ -62,7 +62,7 @@ where
 
     fn from_request(
         req: &actix_web::HttpRequest,
-        payload: &mut actix_web::dev::Payload,
+        _payload: &mut actix_web::dev::Payload,
     ) -> Self::Future {
         let auth = req.extensions().get::<TokenInfo<T>>().cloned();
         let result = match auth {

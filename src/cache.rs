@@ -1,6 +1,21 @@
 #![allow(clippy::module_name_repetitions, clippy::missing_panics_doc)]
+use jsonwebtoken::jwk::JwkSet;
+use log::{debug, info};
 use reqwest::header::HeaderValue;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+
+use crate::{
+    util::{current_time, decode_jwk},
+    DecodingInfo, JwkSetFetch,
+};
 
 /// Determines settings about updating the JWKS in the background
 /// By default will wait the entire refresh period before triggering an update
@@ -89,36 +104,125 @@ pub enum CacheUpdateAction {
     CacheUpdate(CacheConfig),
     JwksAndCacheUpdate(CacheConfig),
 }
-impl CacheUpdateAction {
-    // Determines if the content of the jwks has changed
-    pub(crate) fn content_changed(&self) -> bool {
-        match self {
-            CacheUpdateAction::NoUpdate | CacheUpdateAction::CacheUpdate(_) => false,
-            CacheUpdateAction::JwksUpdate | CacheUpdateAction::JwksAndCacheUpdate(_) => true,
-        }
-    }
 
-    pub(crate) fn cache_changed(&self) -> Option<CacheConfig> {
-        match self {
-            CacheUpdateAction::NoUpdate | CacheUpdateAction::JwksUpdate => None,
-
-            CacheUpdateAction::CacheUpdate(val) | CacheUpdateAction::JwksAndCacheUpdate(val) => {
-                Some(*val)
-            }
-        }
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheError {
     MissingKid,
     DecodeError,
 }
 
+pub struct CacheState {
+    last_update: AtomicU64,
+    is_revalidating: AtomicBool,
+    is_error: AtomicBool,
+}
+
+impl CacheState {
+    pub fn new() -> Self {
+        Self {
+            last_update: AtomicU64::new(current_time()),
+            is_revalidating: AtomicBool::new(false),
+            is_error: AtomicBool::new(false),
+        }
+    }
+    pub fn is_error(&self) -> bool {
+        self.is_error.load(Ordering::Acquire)
+    }
+    pub fn set_is_error(&self, value: bool) {
+        self.is_error.store(value, Ordering::Release);
+    }
+
+    pub fn last_update(&self) -> u64 {
+        self.last_update.load(Ordering::Acquire)
+    }
+    pub fn set_last_update(&self, timestamp: u64) {
+        self.last_update.store(timestamp, Ordering::Release);
+    }
+
+    pub fn is_revalidating(&self) -> bool {
+        self.is_revalidating.load(Ordering::Acquire)
+    }
+
+    pub fn set_is_revalidating(&self, value: bool) {
+        self.is_revalidating.store(value, Ordering::Release);
+    }
+}
+
+impl Default for CacheState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//Decoding info is stored in an Arc so it can be owned by multiple threads.
+pub struct JwkSetCache {
+    jwks: JwkSet,
+    decoding_map: HashMap<String, Arc<DecodingInfo>>,
+    pub cache_policy: CacheConfig,
+}
+
+impl JwkSetCache {
+    pub fn new(jwks: JwkSet, config: CacheConfig) -> Self {
+        Self {
+            jwks,
+            decoding_map: HashMap::new(),
+            cache_policy: config,
+        }
+    }
+
+    fn update_jwks(&mut self, new_jwks: JwkSet) {
+        self.jwks = new_jwks;
+        let keys = self.jwks.keys.iter().filter_map(|i| decode_jwk(i).ok());
+        // Clear our cache of decoding keys
+        self.decoding_map.clear();
+        // Load the keys back into our hashmap cache.
+        for key in keys {
+            self.decoding_map.insert(key.0, Arc::new(key.1));
+        }
+    }
+
+    pub fn get_key(&self, kid: &str) -> Option<Arc<DecodingInfo>> {
+        self.decoding_map.get(kid).cloned()
+    }
+
+    pub(crate) fn update_fetch(&mut self, fetch: JwkSetFetch) -> CacheUpdateAction {
+        let new_jwks = fetch.jwks;
+        // If we didn't parse out a cache policy from the last request
+        // Assume that it's the same as the last
+        let cache_policy = fetch.cache_policy.unwrap_or(self.cache_policy);
+        match (self.jwks == new_jwks, self.cache_policy == cache_policy) {
+            // Everything is the same
+            (true, true) => {
+                debug!("JWKS Content has not changed since last update");
+                CacheUpdateAction::NoUpdate
+            }
+            // The JWKS changed but the cache policy hasn't
+            (false, true) => {
+                info!("JWKS Content has changed since last update");
+                self.update_jwks(new_jwks);
+                CacheUpdateAction::JwksUpdate
+            }
+            // The cache policy changed, but the JWKS hasn't
+            (true, false) => {
+                self.cache_policy = cache_policy;
+                CacheUpdateAction::CacheUpdate(cache_policy)
+            }
+            // Both the cache and the JWKS have changed
+            (false, false) => {
+                info!("cache-control header and JWKS content has changed since last update");
+                self.update_jwks(new_jwks);
+                self.cache_policy = cache_policy;
+                CacheUpdateAction::JwksAndCacheUpdate(cache_policy)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn validate_headers() {
-        let input = vec![
+        let _input = vec![
             "max-age=604800",
             "no-cache",
             "max-age=604800, must-revalidate",

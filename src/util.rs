@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 
 use crate::{DecodingInfo, JWKSValidationError};
@@ -39,5 +41,12 @@ pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), JWKSValida
 
 fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, JWKSValidationError> {
     base64::decode_config(input, base64::URL_SAFE_NO_PAD)
-        .map_err(|e| JWKSValidationError::DecodeError)
+        .map_err(|_| JWKSValidationError::DecodeError)
+}
+
+pub(crate) fn current_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time Went Backwards")
+        .as_secs()
 }

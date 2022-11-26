@@ -1,22 +1,15 @@
 #![warn(clippy::pedantic)]
-#![allow(unused, clippy::missing_errors_doc, clippy::must_use_candidate)]
-use actix_web::cookie::time::util::is_leap_year;
-use cache::{CacheConfig, CacheStrat, CacheUpdateAction};
-use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
+#![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
+use crate::util::current_time;
+use cache::{CacheConfig, CacheState, CacheStrat, CacheUpdateAction, JwkSetCache};
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
-use reqwest::header::ToStrError;
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::{self, JoinHandle};
-use tokio::time::{Instant, MissedTickBehavior};
-use tracing::instrument;
-use util::decode_jwk;
-
 use log::{debug, info, warn};
+
+use serde::Deserialize;
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use reqwest::header::CACHE_CONTROL;
 
@@ -24,53 +17,14 @@ pub mod cache;
 pub mod middleware;
 pub mod util;
 
-const CONFIG_URL_SUFFIX: &str = ".well-known/openid-configuration";
 
-#[derive(Debug, serde::Deserialize)]
-struct OidcConfig {
-    jwks_uri: String,
-}
-
-async fn discover_jwks(
-    url: String,
-    client: &reqwest::Client,
-) -> Result<OidcConfig, JWKSFetchError> {
-    let client = client
-        .get(url)
-        .send()
-        .await
-        .map_err(JWKSFetchError::RequestFailed)?;
-
-    client.json().await.map_err(JWKSFetchError::RequestFailed)
-}
-
-#[derive(Debug)]
-pub enum JWKSFetchError {
-    RequestFailed(reqwest::Error),
-    DiscoverError,
-    JSONDecodeError,
-    IssuerParseError,
-}
-
-#[derive(Debug)]
-pub enum JWKSValidationError {
-    InvalidHeader,
-    MiddingKid,
-    InvakidJKW,
-    InvalidAlgo,
-    NonMatchingJWK,
-    DecodeError,
-    MissingToken,
-    TokenParseFailed,
-}
 #[derive(Clone)]
 pub struct Validator {
     issuer: String,
-    jwks_uri: String,
     http_client: reqwest::Client,
     cache: Arc<RwLock<JwkSetCache>>,
     cache_strat: CacheStrat,
-    is_revalidating: Arc<AtomicBool>,
+    cache_state: Arc<CacheState>,
 }
 
 impl Validator {
@@ -78,11 +32,8 @@ impl Validator {
         oidc_issuer: impl AsRef<str>,
         http_client: reqwest::Client,
         cache_strat: CacheStrat,
-    ) -> Result<Validator, JWKSFetchError> {
+    ) -> Result<Validator, anyhow::Error> {
         let issuer = oidc_issuer.as_ref().trim_end_matches('/').to_string();
-        let discovery_url = format!("{issuer}/{CONFIG_URL_SUFFIX}");
-
-        let jwks_uri = discover_jwks(discovery_url, &http_client).await?.jwks_uri;
 
         //Create an empty JWKS to initalize our Cache
         let jwks = JwkSet { keys: Vec::new() };
@@ -93,35 +44,47 @@ impl Validator {
         };
 
         let cache = Arc::new(RwLock::new(JwkSetCache::new(jwks, cache_config)));
-
+        let cache_state = Arc::new(CacheState::new());
         //Create the Validator
         let client = Self {
             issuer,
-            jwks_uri,
             http_client,
             cache,
             cache_strat,
-            is_revalidating: Arc::new(AtomicBool::new(false)),
+            cache_state,
         };
 
         // Replace the empty cache with data from the jwks endpoint before return
         // This ensures it's ready to validate immediatly after use.
-        client.update_cache(UpdatePreference::Update).await?;
+        client.update_cache().await?;
 
         Ok(client)
     }
 
-    async fn get_jwks(&self) -> Result<JwkSetFetch, JWKSFetchError> {
-        let uri = &self.jwks_uri;
+    fn openid_config_url(&self) -> String {
+        format!("{}/.well-known/openid-configuration", &self.issuer)
+    }
+
+    async fn get_openid_config(&self) -> Result<OidcConfig, anyhow::Error> {
+        let request = self
+            .http_client
+            .get(&self.openid_config_url())
+            .send()
+            .await?;
+        let config = request.json().await?;
+        Ok(config)
+    }
+
+    async fn jwks_uri(&self) -> Result<String, anyhow::Error> {
+        Ok(self.get_openid_config().await?.jwks_uri)
+    }
+
+    async fn get_jwks(&self) -> Result<JwkSetFetch, anyhow::Error> {
+        let uri = &self.jwks_uri().await?;
         // Get the jwks endpoint
         debug!("Requesting JWKS From Uri: {uri}");
-        let fetched_at = tokio::time::Instant::now();
-        let result = self
-            .http_client
-            .get(uri)
-            .send()
-            .await
-            .map_err(JWKSFetchError::RequestFailed)?;
+
+        let result = self.http_client.get(uri).send().await?;
 
         let cache_policy = {
             // If we haven't manually set a caching strategy
@@ -135,11 +98,8 @@ impl Validator {
             }
         };
 
-        let jwks: JwkSet = result
-            .json()
-            .await
-            .map_err(|e| JWKSFetchError::JSONDecodeError)?;
-
+        let jwks: JwkSet = result.json().await?;
+        let fetched_at = current_time();
         Ok(JwkSetFetch {
             jwks,
             cache_policy,
@@ -148,28 +108,19 @@ impl Validator {
     }
 
     /// Triggers an immediate update from the JWKS URL
-    async fn update_cache(
-        &self,
-        preference: UpdatePreference,
-    ) -> Result<CacheUpdateAction, JWKSFetchError> {
+    async fn update_cache(&self) -> Result<CacheUpdateAction, anyhow::Error> {
         info!("Triggering update to JWKS Cache");
-        let (fetch, mut cache) = match preference {
-            // Lock as early as possible
-            UpdatePreference::Update => tokio::join!(self.get_jwks(), self.cache.write()),
-            // Lock as late as possible
-            UpdatePreference::Revalidate => {
-                let fetch = self.get_jwks().await;
-                let mut cache = self.cache.write().await;
-                (fetch, cache)
-            }
-        };
+        let fetch = self.get_jwks().await;
+
         match fetch {
             Ok(fetch) => {
-                cache.last_update_failed = false;
+                self.cache_state.set_last_update(fetch.fetched_at);
+                self.cache_state.set_is_error(false);
+                let mut cache = self.cache.write().await;
                 Ok(cache.update_fetch(fetch))
             }
             Err(e) => {
-                cache.last_update_failed = true;
+                self.cache_state.set_is_error(true);
                 Err(e)
             }
         }
@@ -178,12 +129,16 @@ impl Validator {
     // Triggers an eventual update from the JWKS URL
     fn revalidate_cache(&self) {
         // only attempts to spawn a task if there isn't currently one running
-        if !self.is_revalidating.load(Ordering::SeqCst) {
+        if !self.cache_state.is_revalidating() {
             let self_ref = self.clone();
+
             tokio::task::spawn(async move {
-                self_ref.is_revalidating.store(true, Ordering::SeqCst);
-                self_ref.update_cache(UpdatePreference::Revalidate).await;
-                self_ref.is_revalidating.store(false, Ordering::SeqCst);
+                self_ref.cache_state.set_is_revalidating(true);
+                #[allow(unused_must_use)]
+                {
+                    self_ref.update_cache().await;
+                };
+                self_ref.cache_state.set_is_revalidating(false);
             });
         }
     }
@@ -215,7 +170,11 @@ impl Validator {
             Ok(key)
         } else {
             // Try and invalidate our cache. Maybe the JWKS has changed or our cached values expired
-            self.update_cache(UpdatePreference::Update).await;
+            // Even if it failed it. It may allow us to retrieve a key from stale-if-error
+            #[allow(unused_must_use)]
+            {
+                self.update_cache().await;
+            }
             self.get_kid(kid)
                 .await
                 .ok_or(JWKSValidationError::NonMatchingJWK)
@@ -226,24 +185,26 @@ impl Validator {
         debug!("Waiting on read-lock for cache");
         let read_cache = &self.cache.read().await;
 
-        let elapsed = read_cache.last_update.elapsed();
-        let max_age = read_cache.cache_policy.max_age;
+        let now = current_time();
 
-        if elapsed <= max_age {
+        let fetched = self.cache_state.last_update();
+        let max_age = fetched + read_cache.cache_policy.max_age.as_secs();
+
+        if now <= max_age {
             return read_cache.get_key(kid);
         }
 
         // If the stale while revalidate setting is present
         if let Some(swr) = read_cache.cache_policy.stale_while_revalidate {
             // if we're within the SWR allowed window
-            if elapsed <= swr + max_age {
+            if now <= swr.as_secs() + max_age {
                 self.revalidate_cache();
                 return read_cache.get_key(kid);
             }
         }
         if let Some(swr_err) = read_cache.cache_policy.stale_if_error {
             // if the last update failed and the stale-if-error is present
-            if elapsed <= swr_err + max_age && read_cache.last_update_failed {
+            if now <= swr_err.as_secs() + max_age && self.cache_state.is_error() {
                 self.revalidate_cache();
                 return read_cache.get_key(kid);
             }
@@ -253,87 +214,17 @@ impl Validator {
     }
 }
 
-//Decoding info is stored in an Arc so it can be owned by multiple threads.
-struct JwkSetCache {
-    jwks: JwkSet,
-    decoding_map: HashMap<String, Arc<DecodingInfo>>,
-    cache_policy: CacheConfig,
-    last_update: Instant,
-    last_update_failed: bool,
-}
-
-impl JwkSetCache {
-    pub fn new(jwks: JwkSet, config: CacheConfig) -> Self {
-        Self {
-            jwks,
-            decoding_map: HashMap::new(),
-            cache_policy: config,
-            last_update: Instant::now(),
-            last_update_failed: false,
-        }
-    }
-
-    fn update_jwks(&mut self, new_jwks: JwkSet) {
-        self.jwks = new_jwks;
-        let keys = self.jwks.keys.iter().filter_map(|i| decode_jwk(i).ok());
-        // Clear our cache of decoding keys
-        self.decoding_map.clear();
-        // Load the keys back into our hashmap cache.
-        for key in keys {
-            self.decoding_map.insert(key.0, Arc::new(key.1));
-        }
-    }
-
-    fn get_key(&self, kid: &str) -> Option<Arc<DecodingInfo>> {
-        self.decoding_map.get(kid).cloned()
-    }
-
-    fn update_fetch(&mut self, fetch: JwkSetFetch) -> CacheUpdateAction {
-        let new_jwks = fetch.jwks;
-        // If we didn't parse out a cache policy from the last request
-        // Assume that it's the same as the last
-        let cache_policy = fetch.cache_policy.unwrap_or(self.cache_policy);
-        // update the timestamp we last fetched the jwks from
-        self.last_update = fetch.fetched_at;
-
-        match (self.jwks == new_jwks, self.cache_policy == cache_policy) {
-            // Everything is the same
-            (true, true) => {
-                debug!("JWKS Content has not changed since last update");
-                CacheUpdateAction::NoUpdate
-            }
-            // The JWKS changed but the cache policy hasn't
-            (false, true) => {
-                info!("JWKS Content has changed since last update");
-                self.update_jwks(new_jwks);
-                CacheUpdateAction::JwksUpdate
-            }
-            // The cache policy changed, but the JWKS hasn't
-            (true, false) => {
-                self.cache_policy = cache_policy;
-                CacheUpdateAction::CacheUpdate(cache_policy)
-            }
-            // Both the cache and the JWKS have changed
-            (false, false) => {
-                info!("cache-control header and JWKS content has changed since last update");
-                self.update_jwks(new_jwks);
-                self.cache_policy = cache_policy;
-                CacheUpdateAction::JwksAndCacheUpdate(cache_policy)
-            }
-        }
-    }
-}
-
 /// Struct used to store all information needed to decode a JWT
 /// Intended to be cached inside of `JwkSetCache` to prevent decoding information about the same JWK multiple times
-struct DecodingInfo {
+#[allow(unused)]
+pub struct DecodingInfo {
     jwk: Jwk,
     key: DecodingKey,
     validation: Validation,
     alg: Algorithm,
 }
 impl DecodingInfo {
-    fn new(jwk: Jwk, key: DecodingKey, alg: Algorithm,) -> Self {
+    fn new(jwk: Jwk, key: DecodingKey, alg: Algorithm) -> Self {
         let validation = Validation::new(alg);
         Self {
             jwk,
@@ -359,11 +250,31 @@ impl DecodingInfo {
 pub struct JwkSetFetch {
     jwks: JwkSet,
     cache_policy: Option<CacheConfig>,
-    fetched_at: Instant,
-}
-#[derive(Debug)]
-enum UpdatePreference {
-    Update,
-    Revalidate,
+    fetched_at: u64,
 }
 
+
+#[derive(Debug, Deserialize)]
+struct OidcConfig {
+    jwks_uri: String,
+}
+
+#[derive(Debug)]
+pub enum JWKSFetchError {
+    RequestFailed(reqwest::Error),
+    DiscoverError,
+    JSONDecodeError,
+    IssuerParseError,
+}
+
+#[derive(Debug)]
+pub enum JWKSValidationError {
+    InvalidHeader,
+    MiddingKid,
+    InvakidJKW,
+    InvalidAlgo,
+    NonMatchingJWK,
+    DecodeError,
+    MissingToken,
+    TokenParseFailed,
+}

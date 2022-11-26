@@ -8,9 +8,7 @@ use std::{
 
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    error::HttpError,
-    http::header::HeaderValue,
-    Error, FromRequest, HttpMessage, ResponseError,
+    Error, HttpMessage, ResponseError,
 };
 
 use jsonwebtoken::TokenData;
@@ -108,7 +106,7 @@ where
                 .map_err(|_| {
                     std::convert::Into::<TokenErr>::into(JWKSValidationError::TokenParseFailed)
                 })?;
-                
+
             let token = auth_header.replace("Bearer ", "");
             let result = validator
                 .validate::<Token>(token)
