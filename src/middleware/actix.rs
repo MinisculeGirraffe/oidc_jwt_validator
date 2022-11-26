@@ -108,8 +108,7 @@ where
                 .map_err(|_| {
                     std::convert::Into::<TokenErr>::into(JWKSValidationError::TokenParseFailed)
                 })?;
-
-            //todo There's a better way of doing this
+                
             let token = auth_header.replace("Bearer ", "");
             let result = validator
                 .validate::<Token>(token)

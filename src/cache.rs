@@ -2,7 +2,6 @@
 use reqwest::header::HeaderValue;
 use std::time::Duration;
 
-
 /// Determines settings about updating the JWKS in the background
 /// By default will wait the entire refresh period before triggering an update
 /// unless `immediate_refresh` is set to `true`.
@@ -13,7 +12,6 @@ pub struct CacheConfig {
     pub max_age: Duration,
     pub stale_while_revalidate: Option<Duration>,
     pub stale_if_error: Option<Duration>,
-    pub immutable: bool,
 }
 
 impl CacheConfig {
@@ -55,9 +53,6 @@ impl CacheConfig {
                         self.stale_if_error = Some(Duration::from_secs(secs));
                     }
                 }
-                (Some("immutable"), None) => {
-                    self.immutable = true;
-                }
                 _ => continue,
             };
         }
@@ -67,10 +62,9 @@ impl CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_age: Duration::from_secs(2),
+            max_age: Duration::from_secs(1),
             stale_while_revalidate: None,
             stale_if_error: None,
-            immutable: false,
         }
     }
 }

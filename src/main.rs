@@ -11,6 +11,7 @@ use oidc_jwt_validator::cache::CacheStrat;
 use oidc_jwt_validator::middleware::actix::{TokenInfo, ValidatorMiddlewareFactory};
 use oidc_jwt_validator::Validator;
 use serde::Deserialize;
+
 async fn greet(user: Authenticated<UserClaims>) -> impl Responder {
     format!("Hello {}!", user.claims.email)
 }
