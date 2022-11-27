@@ -1,4 +1,3 @@
-#![allow(clippy::module_name_repetitions, clippy::missing_panics_doc)]
 use jsonwebtoken::jwk::JwkSet;
 use log::{debug, info};
 use reqwest::header::HeaderValue;
@@ -16,19 +15,21 @@ use crate::{
     DecodingInfo, JwkSetFetch,
 };
 
-/// Determines settings about updating the JWKS in the background
-/// By default will wait the entire refresh period before triggering an update
-/// unless `immediate_refresh` is set to `true`.
+/// Determines settings about updating the cached JWKS data.
+/// The JWKS will be lazily revalidated every time [validate](crate::Validator) validates a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheConfig {
+pub struct Settings {
     /// Time in Seconds to refresh the JWKS from the OIDC Provider
-    /// Default: 43200(12 hours)
+    /// Default/Minimum value: 1 Second
     pub max_age: Duration,
+    /// The amount of time a s
     pub stale_while_revalidate: Option<Duration>,
+    /// The amount of time the stale JWKS data should be valid for if we are unable to re-validate it from the URL.
+    /// Minimum Value: 60 Seconds
     pub stale_if_error: Option<Duration>,
 }
 
-impl CacheConfig {
+impl Settings {
     pub fn from_header_val(value: Option<&HeaderValue>) -> Self {
         // Initalize the default config of polling every second
         let mut config = Self::default();
@@ -73,50 +74,54 @@ impl CacheConfig {
     }
 }
 
-impl Default for CacheConfig {
+impl Default for Settings {
     fn default() -> Self {
         Self {
             max_age: Duration::from_secs(1),
             stale_while_revalidate: Some(Duration::from_secs(1)),
-            stale_if_error: Some(Duration::from_secs(30)),
+            stale_if_error: Some(Duration::from_secs(60)),
         }
     }
 }
 
-// Todo Fetch the jwks based on the cache control header.
-// the poll time should be the cache control header
-// if no-cache then we should poll for a minimum amount of time
-// instead of literally just requesting it for every authentication
-// because like holy fuck that just seems inefficent
+/// Determines the JWKS Caching behavior of the validator
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheStrat {
+pub enum Strategy {
+    /// The Reccomended Option.
+    /// Determines [Settings] from the cache-control header on a per request basis.
+    /// Allows for dynamic updating of the cache duration during run time.
     Automatic,
-    Manual(CacheConfig),
+    /// Use a static [Settings] for the lifetime of the program. Ignores cache-control directives
+    /// Not reccomended unless you are *really* sure that you know this will be the correct option
+    /// This option could potentially introduce a security vulnerability if the JWKS has changed, and the value was set too high.
+    Manual(Settings),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheUpdateAction {
-    // We checked the JWKS uri and it was the same as the last time we refreshed it so no action was taken
+pub enum UpdateAction {
+    /// We checked the JWKS uri and it was the same as the last time we refreshed it so no action was taken
     NoUpdate,
-    // We checked the JWKS uri and it was different so we updated our local cache
+    /// We checked the JWKS uri and it was different so we updated our local cache
     JwksUpdate,
-    // The JWKS Uri responded with a different cache-control header
-    CacheUpdate(CacheConfig),
-    JwksAndCacheUpdate(CacheConfig),
+    /// The JWKS Uri responded with a different cache-control header
+    CacheUpdate(Settings),
+    JwksAndCacheUpdate(Settings),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheError {
+pub enum Error {
     MissingKid,
     DecodeError,
 }
-
-pub struct CacheState {
+/// Helper struct for determining when our cache needs to be re-validated
+/// Utilizes atomics to prevent write-locking as much as possible
+#[derive(Debug)]
+pub(crate) struct State {
     last_update: AtomicU64,
     is_revalidating: AtomicBool,
     is_error: AtomicBool,
 }
 
-impl CacheState {
+impl State {
     pub fn new() -> Self {
         Self {
             last_update: AtomicU64::new(current_time()),
@@ -147,27 +152,25 @@ impl CacheState {
     }
 }
 
-impl Default for CacheState {
+impl Default for State {
     fn default() -> Self {
         Self::new()
     }
 }
 
-//Decoding info is stored in an Arc so it can be owned by multiple threads.
-pub struct JwkSetCache {
+/// Helper Struct for storing
+pub struct JwkSetStore {
     pub jwks: JwkSet,
     decoding_map: HashMap<String, Arc<DecodingInfo>>,
-    pub cache_policy: CacheConfig,
-    pub last_update: Instant,
+    pub cache_policy: Settings,
 }
 
-impl JwkSetCache {
-    pub fn new(jwks: JwkSet, config: CacheConfig) -> Self {
+impl JwkSetStore {
+    pub fn new(jwks: JwkSet, config: Settings) -> Self {
         Self {
             jwks,
             decoding_map: HashMap::new(),
             cache_policy: config,
-            last_update: Instant::now(),
         }
     }
 
@@ -186,7 +189,7 @@ impl JwkSetCache {
         self.decoding_map.get(kid).cloned()
     }
 
-    pub(crate) fn update_fetch(&mut self, fetch: JwkSetFetch) -> CacheUpdateAction {
+    pub(crate) fn update_fetch(&mut self, fetch: JwkSetFetch) -> UpdateAction {
         debug!("Decoding JWKS");
         let time = Instant::now();
         let new_jwks = fetch.jwks;
@@ -197,25 +200,25 @@ impl JwkSetCache {
             // Everything is the same
             (true, true) => {
                 debug!("JWKS Content has not changed since last update");
-                CacheUpdateAction::NoUpdate
+                UpdateAction::NoUpdate
             }
             // The JWKS changed but the cache policy hasn't
             (false, true) => {
                 info!("JWKS Content has changed since last update");
                 self.update_jwks(new_jwks);
-                CacheUpdateAction::JwksUpdate
+                UpdateAction::JwksUpdate
             }
             // The cache policy changed, but the JWKS hasn't
             (true, false) => {
                 self.cache_policy = cache_policy;
-                CacheUpdateAction::CacheUpdate(cache_policy)
+                UpdateAction::CacheUpdate(cache_policy)
             }
             // Both the cache and the JWKS have changed
             (false, false) => {
                 info!("cache-control header and JWKS content has changed since last update");
                 self.update_jwks(new_jwks);
                 self.cache_policy = cache_policy;
-                CacheUpdateAction::JwksAndCacheUpdate(cache_policy)
+                UpdateAction::JwksAndCacheUpdate(cache_policy)
             }
         };
         let elapsed = time.elapsed();

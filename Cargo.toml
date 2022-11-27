@@ -11,13 +11,13 @@ edition = "2021"
 
 [dependencies]
 jsonwebtoken = "8.1.1"
-tokio = { version = "1.22.0", features = ["full"] }
+tokio = { version = "1.22.0", features = ["sync"] }
 thiserror = "1.0.37"
-reqwest = { version = "0.11.13", features = ["json","blocking"] }
+reqwest = { version = "0.11.13", features = ["json"] }
 serde = {version = "1.0.147", features = ["derive"] }
 base64 = "0.13.1"
-actix-web = {version = "4.2.1"}
-tracing = "0.1.37"
 log = "0.4.17"
-env_logger = "0.10.0"
-anyhow = "1.0.66"
+
+[dev-dependencies]
+actix-web = {version = "4.2.1"}
+tokio = { version = "1.22.0", features = ["full"] }

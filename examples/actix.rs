@@ -6,10 +6,8 @@ use std::time::Duration;
 
 use actix_web::FromRequest;
 use actix_web::{http::StatusCode, web, App, HttpResponse, HttpServer, Responder, ResponseError};
-use env_logger::Env;
 use jsonwebtoken::TokenData;
-use log::info;
-use oidc_jwt_validator::cache::CacheStrat;
+use oidc_jwt_validator::cache::Strategy;
 use oidc_jwt_validator::Validator;
 use serde::Deserialize;
 
@@ -20,14 +18,13 @@ async fn greet(user: Authenticated<UserClaims>) -> impl Responder {
 #[tokio::main] //
 async fn main() -> std::io::Result<()> {
     let oidc_url = "https://keycloak.udp.lgbt/realms/Main";
-    env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     let client = reqwest::ClientBuilder::new()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
 
-    let validator = Validator::new(oidc_url, client, CacheStrat::Automatic)
+    let validator = Validator::new(oidc_url, client, Strategy::Automatic)
         .await
         .unwrap();
 
@@ -36,7 +33,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(validator.clone())
             .route("/", web::get().to(greet))
     })
-    .bind(("0.0.0.0", 8081))
+    .bind(("0.0.0.0", 8080))
     .unwrap()
     .run()
     .await;
@@ -65,7 +62,6 @@ where
         let req = req.clone();
         Box::pin(async move {
             let validator = req.app_data::<Validator>().ok_or(AuthError::Failed)?;
-            info!("here");
             let token2 = req
                 .headers()
                 .get("Authorization")
@@ -99,8 +95,8 @@ impl Display for AuthError {
     }
 }
 
-impl From<oidc_jwt_validator::JWKSValidationError> for AuthError {
-    fn from(_: oidc_jwt_validator::JWKSValidationError) -> Self {
+impl From<oidc_jwt_validator::ValidationError> for AuthError {
+    fn from(_: oidc_jwt_validator::ValidationError) -> Self {
         Self::Failed
     }
 }

@@ -2,9 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 
-use crate::{DecodingInfo, JWKSValidationError};
+use crate::{DecodingInfo, FetchError};
 
-pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), JWKSValidationError> {
+pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), FetchError> {
     let kid = jwk.common.key_id.clone();
     let alg = jwk.common.algorithm;
 
@@ -25,7 +25,7 @@ pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), JWKSValida
             DecodingKey::from_base64_secret(&params.value).ok()
         }
         jsonwebtoken::jwk::AlgorithmParameters::OctetKeyPair(ref params) => {
-            let der = b64_decode(&params.x).map_err(|_| JWKSValidationError::InvakidJKW)?;
+            let der = b64_decode(&params.x)?;
 
             Some(DecodingKey::from_ed_der(&der))
         }
@@ -35,13 +35,12 @@ pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), JWKSValida
             let info = DecodingInfo::new(jwk.clone(), dec_key, alg);
             Ok((kid, info))
         }
-        _ => Err(JWKSValidationError::InvakidJKW),
+        _ => Err(FetchError::InvalidJWK),
     }
 }
 
-fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, JWKSValidationError> {
+fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, base64::DecodeError> {
     base64::decode_config(input, base64::URL_SAFE_NO_PAD)
-        .map_err(|_| JWKSValidationError::DecodeError)
 }
 
 pub(crate) fn current_time() -> u64 {
