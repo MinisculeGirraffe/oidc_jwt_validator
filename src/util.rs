@@ -2,9 +2,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 
-use crate::{DecodingInfo, FetchError};
+use crate::{DecodingInfo, FetchError, ValidationSettings};
 
-pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), FetchError> {
+pub(crate) fn decode_jwk(
+    jwk: &Jwk,
+    validation: &ValidationSettings,
+) -> Result<(String, DecodingInfo), FetchError> {
     let kid = jwk.common.key_id.clone();
     let alg = jwk.common.algorithm;
 
@@ -32,7 +35,7 @@ pub(crate) fn decode_jwk(jwk: &Jwk) -> Result<(String, DecodingInfo), FetchError
     };
     match (kid, alg, dec_key) {
         (Some(kid), Some(alg), Some(dec_key)) => {
-            let info = DecodingInfo::new(jwk.clone(), dec_key, alg);
+            let info = DecodingInfo::new(jwk.clone(), dec_key, alg, validation);
             Ok((kid, info))
         }
         _ => Err(FetchError::InvalidJWK),

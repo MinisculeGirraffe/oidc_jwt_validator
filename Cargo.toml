@@ -3,6 +3,10 @@ name = "oidc-jwt-validator"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+include = ["/src", "LICENSE.txt", "/examples"]
+repository = "https://github.com/MinisculeGirraffe/oidc_jwt_validator"
+description = "Batteries included validaton of Access Tokens from an OIDC Provider"
+readme = "README.md"
 
 [dependencies]
 jsonwebtoken = "8.1.1"
@@ -15,4 +19,7 @@ log = "0.4.17"
 
 [dev-dependencies]
 actix-web = {version = "4.2.1"}
+serde_json = "1.0.89"
 tokio = { version = "1.22.0", features = ["full"] }
+
+

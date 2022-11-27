@@ -16,7 +16,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation,
 };
 use reqwest::header::CACHE_CONTROL;
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 pub mod cache;
 pub mod util;
@@ -37,6 +37,7 @@ impl Validator {
         oidc_issuer: impl AsRef<str>,
         http_client: reqwest::Client,
         cache_strat: Strategy,
+        validation: ValidationSettings,
     ) -> Result<Validator, FetchError> {
         let issuer = oidc_issuer.as_ref().trim_end_matches('/').to_string();
 
@@ -48,7 +49,11 @@ impl Validator {
             Strategy::Manual(config) => config,
         };
 
-        let cache = Arc::new(RwLock::new(JwkSetStore::new(jwks, cache_config)));
+        let cache = Arc::new(RwLock::new(JwkSetStore::new(
+            jwks,
+            cache_config,
+            validation,
+        )));
         let cache_state = Arc::new(State::new());
         //Create the Validator
         let client = Self {
@@ -250,8 +255,23 @@ pub struct DecodingInfo {
     alg: Algorithm,
 }
 impl DecodingInfo {
-    fn new(jwk: Jwk, key: DecodingKey, alg: Algorithm) -> Self {
-        let validation = Validation::new(alg);
+    fn new(
+        jwk: Jwk,
+        key: DecodingKey,
+        alg: Algorithm,
+        validation_settings: &ValidationSettings,
+    ) -> Self {
+        let mut validation = Validation::new(alg);
+
+        validation.aud = validation_settings.aud.clone();
+        validation.iss = validation_settings.iss.clone();
+        validation.leeway = validation_settings.leeway;
+        validation.required_spec_claims = validation_settings.required_spec_claims.clone();
+
+        validation.sub = validation_settings.sub.clone();
+        validation.validate_exp = validation_settings.validate_exp;
+        validation.validate_nbf = validation_settings.validate_nbf;
+
         Self {
             jwk,
             key,
@@ -318,7 +338,7 @@ pub enum ValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationSettings {
-    pub required_spec_claims: HashSet<SpecClaims>,
+    pub required_spec_claims: HashSet<String>,
     pub leeway: u64,
     pub validate_exp: bool,
     pub validate_nbf: bool,
@@ -327,24 +347,46 @@ pub struct ValidationSettings {
     pub sub: Option<String>,
 }
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
-pub enum SpecClaims {
-    Iss,
-    Aud,
-    Sub,
-    Nbf,
-    Exp,
+impl ValidationSettings {
+    pub fn new() -> Self {
+        let mut required_spec_claims = HashSet::with_capacity(1);
+        required_spec_claims.insert("exp".to_owned());
+
+        Self {
+            required_spec_claims,
+            leeway: 60,
+            validate_exp: true,
+            validate_nbf: false,
+            aud: None,
+            iss: None,
+            sub: None,
+        }
+    }
+
+    /// `aud` is a collection of one or more acceptable audience members
+    /// The simple usage is `set_audience(&["some aud name"])`
+    pub fn set_audience<T: ToString>(&mut self, items: &[T]) {
+        self.aud = Some(items.iter().map(std::string::ToString::to_string).collect());
+    }
+
+    /// `iss` is a collection of one or more acceptable issuers members
+    /// The simple usage is `set_issuer(&["some iss name"])`
+    pub fn set_issuer<T: ToString>(&mut self, items: &[T]) {
+        self.iss = Some(items.iter().map(std::string::ToString::to_string).collect());
+    }
+
+    /// Which claims are required to be present for this JWT to be considered valid.
+    /// The only values that will be considered are "exp", "nbf", "aud", "iss", "sub".
+    /// The simple usage is `set_required_spec_claims(&["exp", "nbf"])`.
+    /// If you want to have an empty set, do not use this function - set an empty set on the struct
+    /// param directly.
+    pub fn set_required_spec_claims<T: ToString>(&mut self, items: &[T]) {
+        self.required_spec_claims = items.iter().map(std::string::ToString::to_string).collect();
+    }
 }
 
-impl Display for SpecClaims {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = match self {
-            SpecClaims::Iss => "iss",
-            SpecClaims::Aud => "aud",
-            SpecClaims::Sub => "sub",
-            SpecClaims::Nbf => "nbf",
-            SpecClaims::Exp => "exp",
-        };
-        write!(f, "{str}")
+impl Default for ValidationSettings {
+    fn default() -> Self {
+        Self::new()
     }
 }

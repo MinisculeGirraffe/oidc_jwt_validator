@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     util::{current_time, decode_jwk},
-    DecodingInfo, JwkSetFetch,
+    DecodingInfo, JwkSetFetch, ValidationSettings,
 };
 
 /// Determines settings about updating the cached JWKS data.
@@ -163,20 +163,26 @@ pub struct JwkSetStore {
     pub jwks: JwkSet,
     decoding_map: HashMap<String, Arc<DecodingInfo>>,
     pub cache_policy: Settings,
+    validation: ValidationSettings,
 }
 
 impl JwkSetStore {
-    pub fn new(jwks: JwkSet, config: Settings) -> Self {
+    pub fn new(jwks: JwkSet, cache_config: Settings, validation: ValidationSettings) -> Self {
         Self {
             jwks,
             decoding_map: HashMap::new(),
-            cache_policy: config,
+            cache_policy: cache_config,
+            validation,
         }
     }
 
     fn update_jwks(&mut self, new_jwks: JwkSet) {
         self.jwks = new_jwks;
-        let keys = self.jwks.keys.iter().filter_map(|i| decode_jwk(i).ok());
+        let keys = self
+            .jwks
+            .keys
+            .iter()
+            .filter_map(|i| decode_jwk(i, &self.validation).ok());
         // Clear our cache of decoding keys
         self.decoding_map.clear();
         // Load the keys back into our hashmap cache.

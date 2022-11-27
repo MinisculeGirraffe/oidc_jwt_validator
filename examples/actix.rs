@@ -8,14 +8,14 @@ use actix_web::FromRequest;
 use actix_web::{http::StatusCode, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use jsonwebtoken::TokenData;
 use oidc_jwt_validator::cache::Strategy;
-use oidc_jwt_validator::Validator;
+use oidc_jwt_validator::{ValidationSettings, Validator};
 use serde::Deserialize;
 
 async fn greet(user: Authenticated<UserClaims>) -> impl Responder {
-    format!("Hello {}!", user.claims.email)
+    format!("Hello {}!", user.claims.name)
 }
 
-#[tokio::main] //
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     let oidc_url = "https://keycloak.udp.lgbt/realms/Main";
 
@@ -24,7 +24,11 @@ async fn main() -> std::io::Result<()> {
         .build()
         .unwrap();
 
-    let validator = Validator::new(oidc_url, client, Strategy::Automatic)
+    let mut settings = ValidationSettings::new();
+    settings.set_issuer(&[oidc_url]);
+    settings.set_audience(&["account"]);
+
+    let validator = Validator::new(oidc_url, client, Strategy::Automatic, settings)
         .await
         .unwrap();
 
@@ -40,9 +44,10 @@ async fn main() -> std::io::Result<()> {
 
     Ok(())
 }
+
 #[derive(Debug, Deserialize, Clone)]
 struct UserClaims {
-    email: String,
+    name: String,
 }
 
 struct Authenticated<T>(TokenData<T>);
