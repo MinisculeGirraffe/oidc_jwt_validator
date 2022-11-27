@@ -7,16 +7,14 @@ use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 use log::{debug, info, warn};
 
 use serde::Deserialize;
-
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Instant;
+use tokio::sync::{Notify, RwLock};
 
 use reqwest::header::CACHE_CONTROL;
 
 pub mod cache;
-pub mod middleware;
 pub mod util;
-
 
 #[derive(Clone)]
 pub struct Validator {
@@ -25,6 +23,7 @@ pub struct Validator {
     cache: Arc<RwLock<JwkSetCache>>,
     cache_strat: CacheStrat,
     cache_state: Arc<CacheState>,
+    notifier: Arc<Notify>,
 }
 
 impl Validator {
@@ -52,6 +51,7 @@ impl Validator {
             cache,
             cache_strat,
             cache_state,
+            notifier: Arc::new(Notify::new()),
         };
 
         // Replace the empty cache with data from the jwks endpoint before return
@@ -83,7 +83,6 @@ impl Validator {
         let uri = &self.jwks_uri().await?;
         // Get the jwks endpoint
         debug!("Requesting JWKS From Uri: {uri}");
-
         let result = self.http_client.get(uri).send().await?;
 
         let cache_policy = {
@@ -109,15 +108,23 @@ impl Validator {
 
     /// Triggers an immediate update from the JWKS URL
     async fn update_cache(&self) -> Result<CacheUpdateAction, anyhow::Error> {
-        info!("Triggering update to JWKS Cache");
         let fetch = self.get_jwks().await;
-
         match fetch {
             Ok(fetch) => {
                 self.cache_state.set_last_update(fetch.fetched_at);
+                info!("Set Last update to {:#?}", fetch.fetched_at);
                 self.cache_state.set_is_error(false);
-                let mut cache = self.cache.write().await;
-                Ok(cache.update_fetch(fetch))
+                let read = self.cache.read().await;
+
+                if read.jwks == fetch.jwks
+                    && fetch.cache_policy.unwrap_or(read.cache_policy) == read.cache_policy
+                {
+                    return Ok(CacheUpdateAction::NoUpdate);
+                }
+                drop(read);
+                let mut write = self.cache.write().await;
+
+                Ok(write.update_fetch(fetch))
             }
             Err(e) => {
                 self.cache_state.set_is_error(true);
@@ -128,35 +135,51 @@ impl Validator {
 
     // Triggers an eventual update from the JWKS URL
     fn revalidate_cache(&self) {
-        // only attempts to spawn a task if there isn't currently one running
         if !self.cache_state.is_revalidating() {
-            let self_ref = self.clone();
-
+            self.cache_state.set_is_revalidating(true);
+            info!("Spawning Update Task");
+            let a = self.clone();
+            #[allow(unused_must_use)]
             tokio::task::spawn(async move {
-                self_ref.cache_state.set_is_revalidating(true);
-                #[allow(unused_must_use)]
-                {
-                    self_ref.update_cache().await;
-                };
-                self_ref.cache_state.set_is_revalidating(false);
+                a.update_cache().await;
+                a.cache_state.set_is_revalidating(false);
+                a.notifier.notify_waiters();
             });
         }
     }
+
     /// Validates a JWT, Returning the claims serialized into type of T
     pub async fn validate<T>(
         &self,
         token: impl AsRef<str>,
     ) -> Result<TokenData<T>, JWKSValidationError>
     where
-        T: for<'de> serde::de::Deserialize<'de>,
+        T: for<'de> serde::de::Deserialize<'de> + Send + 'static,
     {
-        let token = token.as_ref();
+        debug!("Validating Token");
+        let time = Instant::now();
+        let token = token.as_ref().to_owned();
         // Early return error conditions before acquiring a read lock
         let header =
-            jsonwebtoken::decode_header(token).map_err(|_| JWKSValidationError::InvalidHeader)?;
+            jsonwebtoken::decode_header(&token).map_err(|_| JWKSValidationError::InvalidHeader)?;
+
         let kid = header.kid.ok_or(JWKSValidationError::MiddingKid)?;
 
-        self.get_kid_retry(kid).await?.decode(token)
+        let decoding_key = self.get_kid_retry(kid).await?;
+        let key_time = time.elapsed();
+        let time = Instant::now();
+        let decoded = tokio::task::spawn_blocking(move || decoding_key.decode(&token))
+            .await
+            .map_err(|_| JWKSValidationError::DecodeError)?;
+        let decoding_time = time.elapsed();
+
+        debug!(
+            "Decode {:#?} and validated in {:#?}. Total: {:#?}",
+            key_time,
+            decoding_time,
+            key_time + decoding_time
+        );
+        decoded
     }
 
     async fn get_kid_retry(
@@ -172,26 +195,30 @@ impl Validator {
             // Try and invalidate our cache. Maybe the JWKS has changed or our cached values expired
             // Even if it failed it. It may allow us to retrieve a key from stale-if-error
             #[allow(unused_must_use)]
-            {
-                self.update_cache().await;
-            }
-            self.get_kid(kid)
-                .await
-                .ok_or(JWKSValidationError::NonMatchingJWK)
+            self.revalidate_cache();
+            self.wait_update().await;
+            let result = self.get_kid(kid).await;
+            result.ok_or(JWKSValidationError::MiddingKid)
+        }
+    }
+
+    async fn wait_update(&self) {
+        if self.cache_state.is_revalidating() {
+            self.notifier.notified().await;
         }
     }
 
     async fn get_kid(&self, kid: &str) -> Option<Arc<DecodingInfo>> {
-        debug!("Waiting on read-lock for cache");
-        let read_cache = &self.cache.read().await;
-
-        let now = current_time();
-
+        let read_cache = self.cache.read().await;
         let fetched = self.cache_state.last_update();
-        let max_age = fetched + read_cache.cache_policy.max_age.as_secs();
+        let max_age_secs = read_cache.cache_policy.max_age.as_secs();
+
+        let max_age = fetched + max_age_secs;
+        let now = current_time();
+        let val = read_cache.get_key(kid);
 
         if now <= max_age {
-            return read_cache.get_key(kid);
+            return val;
         }
 
         // If the stale while revalidate setting is present
@@ -199,17 +226,18 @@ impl Validator {
             // if we're within the SWR allowed window
             if now <= swr.as_secs() + max_age {
                 self.revalidate_cache();
-                return read_cache.get_key(kid);
+                return val;
             }
         }
         if let Some(swr_err) = read_cache.cache_policy.stale_if_error {
             // if the last update failed and the stale-if-error is present
             if now <= swr_err.as_secs() + max_age && self.cache_state.is_error() {
                 self.revalidate_cache();
-                return read_cache.get_key(kid);
+                return val;
             }
         }
-
+        drop(read_cache);
+        info!("Returning None: {now} - {max_age}");
         None
     }
 }
@@ -238,12 +266,8 @@ impl DecodingInfo {
     where
         T: for<'de> serde::de::Deserialize<'de>,
     {
-        debug!("Validating Token: {token}");
-
-        jsonwebtoken::decode::<T>(token, &self.key, &self.validation).map_err(|e| {
-            debug!("Token Validation failed with Error: {e}");
-            JWKSValidationError::DecodeError
-        })
+        jsonwebtoken::decode::<T>(token, &self.key, &self.validation)
+            .map_err(|_| JWKSValidationError::DecodeError)
     }
 }
 #[derive(Debug)]
@@ -252,7 +276,6 @@ pub struct JwkSetFetch {
     cache_policy: Option<CacheConfig>,
     fetched_at: u64,
 }
-
 
 #[derive(Debug, Deserialize)]
 struct OidcConfig {

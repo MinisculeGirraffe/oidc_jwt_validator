@@ -8,9 +8,8 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-
 
 use crate::{
     util::{current_time, decode_jwk},
@@ -78,8 +77,8 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_age: Duration::from_secs(1),
-            stale_while_revalidate: None,
-            stale_if_error: None,
+            stale_while_revalidate: Some(Duration::from_secs(1)),
+            stale_if_error: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -126,25 +125,25 @@ impl CacheState {
         }
     }
     pub fn is_error(&self) -> bool {
-        self.is_error.load(Ordering::Acquire)
+        self.is_error.load(Ordering::SeqCst)
     }
     pub fn set_is_error(&self, value: bool) {
-        self.is_error.store(value, Ordering::Release);
+        self.is_error.store(value, Ordering::SeqCst);
     }
 
     pub fn last_update(&self) -> u64 {
-        self.last_update.load(Ordering::Acquire)
+        self.last_update.load(Ordering::SeqCst)
     }
     pub fn set_last_update(&self, timestamp: u64) {
-        self.last_update.store(timestamp, Ordering::Release);
+        self.last_update.store(timestamp, Ordering::SeqCst);
     }
 
     pub fn is_revalidating(&self) -> bool {
-        self.is_revalidating.load(Ordering::Acquire)
+        self.is_revalidating.load(Ordering::SeqCst)
     }
 
     pub fn set_is_revalidating(&self, value: bool) {
-        self.is_revalidating.store(value, Ordering::Release);
+        self.is_revalidating.store(value, Ordering::SeqCst);
     }
 }
 
@@ -156,9 +155,10 @@ impl Default for CacheState {
 
 //Decoding info is stored in an Arc so it can be owned by multiple threads.
 pub struct JwkSetCache {
-    jwks: JwkSet,
+    pub jwks: JwkSet,
     decoding_map: HashMap<String, Arc<DecodingInfo>>,
     pub cache_policy: CacheConfig,
+    pub last_update: Instant,
 }
 
 impl JwkSetCache {
@@ -167,6 +167,7 @@ impl JwkSetCache {
             jwks,
             decoding_map: HashMap::new(),
             cache_policy: config,
+            last_update: Instant::now(),
         }
     }
 
@@ -186,11 +187,13 @@ impl JwkSetCache {
     }
 
     pub(crate) fn update_fetch(&mut self, fetch: JwkSetFetch) -> CacheUpdateAction {
+        debug!("Decoding JWKS");
+        let time = Instant::now();
         let new_jwks = fetch.jwks;
         // If we didn't parse out a cache policy from the last request
         // Assume that it's the same as the last
         let cache_policy = fetch.cache_policy.unwrap_or(self.cache_policy);
-        match (self.jwks == new_jwks, self.cache_policy == cache_policy) {
+        let result = match (self.jwks == new_jwks, self.cache_policy == cache_policy) {
             // Everything is the same
             (true, true) => {
                 debug!("JWKS Content has not changed since last update");
@@ -214,7 +217,10 @@ impl JwkSetCache {
                 self.cache_policy = cache_policy;
                 CacheUpdateAction::JwksAndCacheUpdate(cache_policy)
             }
-        }
+        };
+        let elapsed = time.elapsed();
+        debug!("Decoded and parsed JWKS in {:#?}", elapsed);
+        result
     }
 }
 
