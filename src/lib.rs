@@ -3,6 +3,7 @@
 
 use serde::Deserialize;
 use thiserror::Error;
+use util::normalize_url;
 
 use crate::{
     cache::{JwkSetStore, Settings, State, Strategy, UpdateAction},
@@ -39,7 +40,7 @@ impl Validator {
         cache_strat: Strategy,
         validation: ValidationSettings,
     ) -> Result<Validator, FetchError> {
-        let issuer = oidc_issuer.as_ref().trim_end_matches('/').to_string();
+        let issuer = normalize_url(oidc_issuer.as_ref());
 
         //Create an empty JWKS to initalize our Cache
         let jwks = JwkSet { keys: Vec::new() };

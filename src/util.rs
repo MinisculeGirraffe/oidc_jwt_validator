@@ -52,3 +52,33 @@ pub(crate) fn current_time() -> u64 {
         .expect("Time Went Backwards")
         .as_secs()
 }
+
+pub(crate) fn normalize_url(url: &str) -> String {
+    let trimmed_url = url.trim_end_matches('/');
+    let stripped_url = trimmed_url
+        .strip_suffix(".well-known/openid-configuration")
+        .map(|i| i.trim_end_matches('/'))
+        .unwrap_or(trimmed_url);
+
+    stripped_url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_url() {
+        assert_eq!(
+            normalize_url("http://example.com//.well-known/openid-configuration"),
+            "http://example.com"
+        );
+        assert_eq!(
+            normalize_url("http://example.com/.well-known/openid-configuration"),
+            "http://example.com"
+        );
+        assert_eq!(normalize_url("http://example.com//"), "http://example.com");
+        assert_eq!(normalize_url("http://example.com/"), "http://example.com");
+        assert_eq!(normalize_url("http://example.com"), "http://example.com");
+    }
+}
