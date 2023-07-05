@@ -55,7 +55,9 @@ impl Validator {
             cache_config,
             validation,
         )));
+
         let cache_state = Arc::new(State::new());
+
         //Create the Validator
         let client = Self {
             issuer,
@@ -180,10 +182,8 @@ impl Validator {
         let token = token.as_ref();
         // Early return error conditions before acquiring a read lock
         let header = jsonwebtoken::decode_header(token)?;
-        let kid = header.kid.ok_or(ValidationError::MissingKID)?;
-
-        let decoding_key = self.get_kid_retry(kid).await?;
-
+        let kid = header.kid.ok_or(ValidationError::MissingKIDToken)?;
+        let decoding_key = self.get_kid_retry(kid).await?.ok_or(ValidationError::MissingKIDJWKS)?;
         let decoded = decoding_key.decode(token)?;
 
         Ok(decoded)
@@ -193,18 +193,18 @@ impl Validator {
     async fn get_kid_retry(
         &self,
         kid: impl AsRef<str>,
-    ) -> Result<Arc<DecodingInfo>, ValidationError> {
+    ) -> Result<Option<Arc<DecodingInfo>>, ValidationError> {
         let kid = kid.as_ref();
         // Check to see if we have the kid
         if let Ok(Some(key)) = self.get_kid(kid).await {
             // if we have it, then return it
-            Ok(key)
+            Ok(Some(key))
         } else {
             // Try and invalidate our cache. Maybe the JWKS has changed or our cached values expired
             // Even if it failed it. It may allow us to retrieve a key from stale-if-error
             self.revalidate_cache();
             self.wait_update().await;
-            self.get_kid(kid).await?.ok_or(ValidationError::CacheError)
+            self.get_kid(kid).await
         }
     }
 
@@ -329,12 +329,14 @@ pub enum ValidationError {
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
     /// Failure to re-validate the JWKS.
     /// Would typically result in a 401 or 500 status code depending on preference
-    #[error("Token was unable to be validated due to cache expiration")]
+    #[error("Token was unable to be validated due to cache expiration.")]
     CacheError,
     /// Token did not contain a kid in its header and would be impossible to validate
     /// Would typically result in a 401 HTTP Status code
     #[error("Token did not contain a KID field")]
-    MissingKID,
+    MissingKIDToken,
+    #[error("The KID in the token was not present in the JWKS")]
+    MissingKIDJWKS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

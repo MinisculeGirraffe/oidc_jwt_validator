@@ -90,9 +90,10 @@ pub enum Strategy {
     /// The Reccomended Option.
     /// Determines [Settings] from the cache-control header on a per request basis.
     /// Allows for dynamic updating of the cache duration during run time.
+    /// If no cache-control headers are present, a lazy 1 second polling interval on the JWKS will be used.
     Automatic,
     /// Use a static [Settings] for the lifetime of the program. Ignores cache-control directives
-    /// Not reccomended unless you are *really* sure that you know this will be the correct option
+    /// Not recommended unless you are *really* sure that you know this will be the correct option
     /// This option could potentially introduce a security vulnerability if the JWKS has changed, and the value was set too high.
     Manual(Settings),
 }
