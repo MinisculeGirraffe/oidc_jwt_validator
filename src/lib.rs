@@ -319,6 +319,8 @@ pub enum FetchError {
     InvalidJWK,
     #[error("Issuer URL Invalid")]
     IssuerParseError,
+    #[error("Invalid algorithm {0}")]
+    InvalidAlgorithm(String),
 }
 
 #[derive(Debug, Error)]

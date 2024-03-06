@@ -1,6 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{jwk::Jwk, DecodingKey};
+use jsonwebtoken::{
+    jwk::{Jwk, KeyAlgorithm},
+    Algorithm, DecodingKey,
+};
 
 use crate::{DecodingInfo, FetchError, ValidationSettings};
 
@@ -9,7 +12,6 @@ pub(crate) fn decode_jwk(
     validation: &ValidationSettings,
 ) -> Result<(String, DecodingInfo), FetchError> {
     let kid = jwk.common.key_id.clone();
-    let alg = jwk.common.algorithm;
 
     let dec_key = match jwk.algorithm {
         jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(ref params) => {
@@ -33,12 +35,34 @@ pub(crate) fn decode_jwk(
             Some(DecodingKey::from_ed_der(&der))
         }
     };
+
+    let alg = jwk.common.key_algorithm.map(to_algorithm);
+
     match (kid, alg, dec_key) {
         (Some(kid), Some(alg), Some(dec_key)) => {
-            let info = DecodingInfo::new(jwk.clone(), dec_key, alg, validation);
+            let info = DecodingInfo::new(jwk.clone(), dec_key, alg?, validation);
             Ok((kid, info))
         }
         _ => Err(FetchError::InvalidJWK),
+    }
+}
+
+// KeyAlgorithm::to_algorithm is private, so we implement an equivalent function here
+fn to_algorithm(key_alg: KeyAlgorithm) -> Result<Algorithm, FetchError> {
+    match key_alg {
+        KeyAlgorithm::HS256 => Ok(Algorithm::HS256),
+        KeyAlgorithm::HS384 => Ok(Algorithm::HS384),
+        KeyAlgorithm::HS512 => Ok(Algorithm::HS512),
+        KeyAlgorithm::RS256 => Ok(Algorithm::RS256),
+        KeyAlgorithm::RS384 => Ok(Algorithm::RS384),
+        KeyAlgorithm::RS512 => Ok(Algorithm::RS512),
+        KeyAlgorithm::PS256 => Ok(Algorithm::PS256),
+        KeyAlgorithm::PS384 => Ok(Algorithm::PS384),
+        KeyAlgorithm::PS512 => Ok(Algorithm::PS512),
+        KeyAlgorithm::ES256 => Ok(Algorithm::ES256),
+        KeyAlgorithm::ES384 => Ok(Algorithm::ES384),
+        KeyAlgorithm::EdDSA => Ok(Algorithm::EdDSA),
+        _ => Err(FetchError::InvalidAlgorithm(key_alg.to_string())),
     }
 }
 

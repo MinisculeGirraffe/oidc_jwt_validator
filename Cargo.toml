@@ -9,7 +9,7 @@ description = "Batteries included validaton of Access Tokens from an OIDC Provid
 readme = "README.md"
 
 [dependencies]
-jsonwebtoken = "8.1.1"
+jsonwebtoken = "9"
 tokio = { version = "1.22.0", features = ["sync"] }
 thiserror = "1.0.37"
 reqwest = { version = "0.11.13", default-features = false, features = ["json"] }
