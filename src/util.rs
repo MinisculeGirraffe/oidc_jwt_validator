@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
     jwk::{Jwk, KeyAlgorithm},
     Algorithm, DecodingKey,
@@ -67,7 +68,7 @@ fn to_algorithm(key_alg: KeyAlgorithm) -> Result<Algorithm, FetchError> {
 }
 
 fn b64_decode<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, base64::DecodeError> {
-    base64::decode_config(input, base64::URL_SAFE_NO_PAD)
+    URL_SAFE_NO_PAD.decode(input)
 }
 
 pub(crate) fn current_time() -> u64 {
